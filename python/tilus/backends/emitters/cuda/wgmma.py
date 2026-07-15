@@ -179,6 +179,9 @@ class WgmmaMmaSSEmitter(WgmmaBaseEmitter):
                         swizzle_mode=encode_swizzle_mode(b_canonical.swizzle_mode),
                     )
                     d_offset = (i * repeat_n + j) * d_local_stride
+                    # scale_d=0 (overwrite, D=A*B) is only valid on the first
+                    # inner-k iteration; subsequent iters must accumulate (D+=A*B).
+                    cur_scale_d = inst.scale_d if k == 0 else 1
                     self.append(
                         wgmma_async(
                             wgmma_config,
@@ -187,5 +190,6 @@ class WgmmaMmaSSEmitter(WgmmaBaseEmitter):
                             b_desc.encoded(),
                             trans_a=0,  # type: ignore
                             trans_b=0,  # type: ignore
+                            scale_d=cur_scale_d,  # type: ignore
                         )
                     )
