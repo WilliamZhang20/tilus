@@ -15,7 +15,7 @@ import io
 import subprocess
 import time
 
-VERSION_NAMES = ["v0", "v1", "v2", "v3", "v4", "v5"]
+VERSION_NAMES = ["v0", "v1", "v2", "v3", "v4", "v5", "v6"]
 
 VERSION_CLASS = {
     "v0": "MatmulTMA",
@@ -24,6 +24,7 @@ VERSION_CLASS = {
     "v3": "MatmulWGMMAV3",
     "v4": "MatmulWGMMAV4",
     "v5": "MatmulWGMMAV5",
+    "v6": "MatmulWGMMAV6",
 }
 
 
@@ -117,7 +118,7 @@ def parse_ncu_report(report_path: str) -> list[tuple[str, dict]]:
 
 
 def benchmark_all(versions: list[str], m_size: int, n_size: int, k_size: int):
-    """Benchmark all versions using benchmark_func."""
+    """Benchmark all versions using benchmark_func (event-loop timing)."""
     import math
 
     import pandas
@@ -136,27 +137,28 @@ def benchmark_all(versions: list[str], m_size: int, n_size: int, k_size: int):
     c_ref = torch.empty(m_size, n_size, dtype=torch.float16, device="cuda")
     c_tilus = torch.empty(m_size, n_size, dtype=torch.float16, device="cuda")
 
-    # cuBLAS baseline first, so we can compute % of cublas
     cublas_lat = benchmark_func(
         lambda: torch.matmul(a, b.T, out=c_ref), warmup=5, repeat=30
     )
-    cublas_tf = 2 * m_size * n_size * k_size / cublas_lat * 1e-9
+
+    def tf(ms):
+        return 2 * m_size * n_size * k_size / ms * 1e-9
+
+    cublas_tf = tf(cublas_lat)
 
     for name in versions:
         try:
             matmul = _load_version(name)()
-            # warmup + correctness check
             matmul(m_size, n_size, k_size, a, b, c_tilus)
             torch.cuda.synchronize()
             torch.testing.assert_close(c_ref, c_tilus, atol=1e-2, rtol=1e-2)
 
-            latency = benchmark_func(
-                lambda: matmul(m_size, n_size, k_size, a, b, c_tilus), warmup=5, repeat=30
+            t = benchmark_func(
+                lambda: matmul(m_size, n_size, k_size, a, b, c_tilus),
+                warmup=5, repeat=30,
             )
-            tf = 2 * m_size * n_size * k_size / latency * 1e-9
-            pct = tf / cublas_tf * 100.0
-            rows.append([f"tilus_{name}", latency, tf, pct])
-            time.sleep(1)  # cool down between runs
+            rows.append([f"tilus_{name}", t, tf(t), tf(t) / cublas_tf * 100.0])
+            time.sleep(1)
         except Exception as e:
             print(f"  tilus_{name}  ERROR: {e}")
             rows.append([f"tilus_{name}", float("nan"), float("nan"), float("nan")])

@@ -1676,12 +1676,12 @@ class StmtBuilder(StmtBuilderCore):
         inst = WgmmaWaitGroupInst.create(n=n)
         self.append(inst)
 
-    def wgmma_mma_ss(self, a: SharedTensor, b: SharedTensor, d: RegisterTensor) -> None:
-        inst = WgmmaMmaSSInst.create(a=a, b=b, d=d)
+    def wgmma_mma_ss(self, a: SharedTensor, b: SharedTensor, d: RegisterTensor, scale_d: int = 1) -> None:
+        inst = WgmmaMmaSSInst.create(a=a, b=b, d=d, scale_d=scale_d)
         self.append(inst)
 
-    def wgmma_mma_rs(self, a: RegisterTensor, b: SharedTensor, d: RegisterTensor) -> None:
-        inst = WgmmaMmaRSInst.create(a=a, b=b, d=d)
+    def wgmma_mma_rs(self, a: RegisterTensor, b: SharedTensor, d: RegisterTensor, scale_d: int = 1) -> None:
+        inst = WgmmaMmaRSInst.create(a=a, b=b, d=d, scale_d=scale_d)
         self.append(inst)
 
     # annotations

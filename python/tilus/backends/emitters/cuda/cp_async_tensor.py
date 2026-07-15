@@ -408,11 +408,6 @@ class CopyAsyncTensorGlobalToSharedInstEmitter(CopyAsyncTensorBaseEmitter):
             global_tensor, offsets=inst.offsets, dims=inst.dims
         )
 
-        shared_tensor_info: SharedTensorInfo = self.resolve_shared_tensor_info(shared_tensor)
-
-        shared_addr = self.shared_tensor_shared_space_addr[shared_tensor]
-        src_tensor_map = ~self.create_tensor_map(global_tensor_info, shared_tensor_info, dtype)
-        coords = list(reversed(inst.offsets))
         optional_multicast_mask = inst.multicast_mask
         predicate = self.tma_predicate
         # `.cta_group::{n}` is a Blackwell (sm_100+) PTX feature; ptxas rejects it on
@@ -420,32 +415,53 @@ class CopyAsyncTensorGlobalToSharedInstEmitter(CopyAsyncTensorBaseEmitter):
         # the inline asm template emits the unqualified TMA instruction.
         cta_group = inst.cta_group if get_current_target().properties.compute_capability >= (10, 0) else None
 
-        if optional_multicast_mask is None:
-            self.append(
-                cp_async_tensor_global_to_shared(
-                    dst=shared_addr,
-                    src_tensor_map=src_tensor_map,
-                    coords=coords,
-                    mbarrier=inst.mbarrier,
-                    cta_group=cta_group,
-                    cache_policy=inst.cache_policy,
-                    predicate=predicate,
+        # Resolve the shared destination as one TMA box, or fall back to per-segment
+        # boxes for layouts that split a dim into stacked sub-boxes. This handles
+        # block_k > swizzle-atom-width (e.g. block_k=128 with 128B swizzle splits
+        # the contiguous dim into [S, atom] — what cuBLAS expresses with 4D TMA).
+        try:
+            shared_tensor_info: SharedTensorInfo = self.resolve_shared_tensor_info(shared_tensor)
+            segments: list[tuple[SharedTensorInfo, int]] = [(shared_tensor_info, 0)]
+            seg_dim: Optional[int] = None
+        except NotImplementedError:
+            segments, seg_dim = self.resolve_shared_tensor_segments(shared_tensor)
+
+        # All segments share box shape and swizzle, so reuse one descriptor.
+        first_info = segments[0][0]
+        tensor_map = ~self.create_tensor_map(global_tensor_info, first_info, dtype)
+
+        for info, segment_offset in segments:
+            tensor_coords = list(inst.offsets)
+            if seg_dim is not None and segment_offset != 0:
+                global_seg_dim = inst.dims[seg_dim]
+                tensor_coords[global_seg_dim] = tensor_coords[global_seg_dim] + segment_offset
+            coords = list(reversed(tensor_coords))
+            if optional_multicast_mask is None:
+                self.append(
+                    cp_async_tensor_global_to_shared(
+                        dst=info.addr,
+                        src_tensor_map=tensor_map,
+                        coords=coords,
+                        mbarrier=inst.mbarrier,
+                        cta_group=cta_group,
+                        cache_policy=inst.cache_policy,
+                        predicate=predicate,
+                    )
                 )
-            )
-        else:
-            multicast_mask: Expr = optional_multicast_mask
-            self.append(
-                cp_async_tensor_global_to_cluster_shared(
-                    dst=shared_addr,
-                    src_tensor_map=src_tensor_map,
-                    coords=coords,
-                    mbarrier=inst.mbarrier,
-                    multicast_mask=multicast_mask,
-                    cta_group=cta_group,
-                    cache_policy=inst.cache_policy,
-                    predicate=predicate,
+            else:
+                multicast_mask: Expr = optional_multicast_mask
+                self.append(
+                    cp_async_tensor_global_to_cluster_shared(
+                        dst=info.addr,
+                        src_tensor_map=tensor_map,
+                        coords=coords,
+                        mbarrier=inst.mbarrier,
+                        multicast_mask=multicast_mask,
+                        cta_group=cta_group,
+                        cache_policy=inst.cache_policy,
+                        predicate=predicate,
+                    )
                 )
-            )
 
 
 @register_emitter(CopyAsyncTensorSharedToGlobalInst, target=nvgpu_sm90)

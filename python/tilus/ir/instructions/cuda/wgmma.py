@@ -49,6 +49,9 @@ class WgmmaWaitGroupInst(Instruction):
 
 @dataclass(frozen=True, eq=False)
 class WgmmaMmaSSInst(Instruction):
+    # scale_d=1: D = A*B + D (accumulate). scale_d=0: D = A*B (overwrite).
+    scale_d: int = 1
+
     @staticmethod
     def get_inst_mnk(
         m: int, n: int, k: int, a_dtype: DataType, b_dtype: DataType, d_dtype: DataType
@@ -72,12 +75,14 @@ class WgmmaMmaSSInst(Instruction):
         return inst_m, inst_n, inst_k
 
     @staticmethod
-    def create(a: SharedTensor, b: SharedTensor, d: RegisterTensor) -> WgmmaMmaSSInst:
-        return WgmmaMmaSSInst(output=None, inputs=(a, b, d))
+    def create(a: SharedTensor, b: SharedTensor, d: RegisterTensor, scale_d: int = 1) -> WgmmaMmaSSInst:
+        return WgmmaMmaSSInst(output=None, inputs=(a, b, d), scale_d=scale_d)
 
 
 @dataclass(frozen=True, eq=False)
 class WgmmaMmaRSInst(Instruction):
+    scale_d: int = 1
+
     @staticmethod
-    def create(a: RegisterTensor, b: SharedTensor, d: RegisterTensor) -> WgmmaMmaRSInst:
-        return WgmmaMmaRSInst(output=None, inputs=(a, b, d))
+    def create(a: RegisterTensor, b: SharedTensor, d: RegisterTensor, scale_d: int = 1) -> WgmmaMmaRSInst:
+        return WgmmaMmaRSInst(output=None, inputs=(a, b, d), scale_d=scale_d)

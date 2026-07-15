@@ -74,15 +74,21 @@ class Pipeline(tilus.Class):
         return self.empty_barriers[prev_stage]
 
 
-# Tightened autotune space: drop block_m=128/n=64 (skinny → poor wgmma fill),
-# drop block_m=256/n=128 (heavy register pressure), drop num_stages=2 (too
-# shallow to hide TMA), drop num_stages=7 (smem-thrashing on 256×256), drop
-# swizzle_size=1 (≡ default rasterization, no L2 win). The remaining 60 configs
-# are biased toward shapes cuBLAS uses for 8K² fp16 GEMMs.
+# Keeps the original tightened (num_stages, block_m/n, block_k) search
+# space -- widening it to match v3's full space diluted the autotuner's
+# search budget across too many configs and made it find worse swizzled
+# configs on large shapes (e.g. 8192^3 dropped from ~82% to ~66% of
+# cuBLAS). The only addition is swizzle_size=1, a true bypass to v3's
+# exact grid + synchronous MMA loop (see __call__ below): profiling on a
+# small, fast shape (4096^3, ~0.24ms) showed the swizzle-grouping address
+# math and the wait_group(1) lookahead pipelining both add a small, fixed
+# cost that isn't worth it when there's little work to amortize it over.
+# Larger shapes still autotune into swizzle_size=4/8 for a large win from
+# L2 reuse.
 @tilus.autotune("num_stages", [3, 4, 5, 6])
 @tilus.autotune("block_m, block_n", [[128, 128], [128, 256], [256, 256]])
 @tilus.autotune("block_k", [16, 32, 64])
-@tilus.autotune("swizzle_size", [4, 8])
+@tilus.autotune("swizzle_size", [1, 4, 8])
 class MatmulWGMMAV4(tilus.Script):
     def __init__(self, num_stages, block_m, block_n, block_k, swizzle_size):
         super().__init__()
@@ -126,17 +132,29 @@ class MatmulWGMMAV4(tilus.Script):
     ):
         num_stages = self.num_stages
         block_m, block_n, block_k = self.block_m, self.block_n, self.block_k
+        swizzle_size = self.swizzle_size
 
         num_m_blocks = cdiv(m_size, block_m)
         num_n_blocks = cdiv(n_size, block_n)
-        self.attrs.blocks = num_m_blocks * num_n_blocks
         self.attrs.warps = 5
 
-        m_block, n_block = self.compute_block_coord(
-            self.blockIdx.x, num_m_blocks, num_n_blocks
-        )
-        offset_m: int32 = m_block * block_m
-        offset_n: int32 = n_block * block_n
+        offset_m: int32 = 0
+        offset_n: int32 = 0
+        if swizzle_size == 1:
+            # Bypass: plain 2D grid, identical rasterization to v3, with none
+            # of the swizzle-group address computation below. Resolved at
+            # trace time (swizzle_size is a compile-time autotune constant),
+            # so this branch costs nothing when swizzling is used instead.
+            self.attrs.blocks = [num_m_blocks, num_n_blocks]
+            offset_m = block_m * self.blockIdx.x
+            offset_n = block_n * self.blockIdx.y
+        else:
+            self.attrs.blocks = num_m_blocks * num_n_blocks
+            m_block, n_block = self.compute_block_coord(
+                self.blockIdx.x, num_m_blocks, num_n_blocks
+            )
+            offset_m = m_block * block_m
+            offset_n = n_block * block_n
 
         ga = self.global_view(a_ptr, dtype=float16, shape=[m_size, k_size])
         gb = self.global_view(b_ptr, dtype=float16, shape=[n_size, k_size])
@@ -182,38 +200,60 @@ class MatmulWGMMAV4(tilus.Script):
                 tma_pipe.producer_advance()
 
         with self.thread_group(thread_begin=0, num_threads=128):  # WGMMA consumer
-            # Prologue: issue first MMA; don't release stage 0 yet (it is
-            # still being read; we release it in the first main-loop iteration
-            # after wait_group(1) confirms the MMA is done).
-            tma_pipe.consumer_acquire()
-            self.wgmma.fence()
-            self.wgmma.mma(
-                sa[tma_pipe.consumer_stage], sb[tma_pipe.consumer_stage].transpose(), acc
-            )
-            self.wgmma.commit_group()
-            tma_pipe.consumer_advance()
-
-            # Main loop: issue MMA then call wait_group(1) *after* commit so
-            # the hardware can pipeline the current and previous groups while
-            # the TMA wait (consumer_acquire) was overlapping with the prior
-            # group. wait_group(1) stalls until the *previous* group (n-1) is
-            # done, then we safely release its stage before advancing.
-            for offset_k in self.range(block_k, k_size, block_k, unroll=num_stages):
+            if swizzle_size == 1:
+                # Bypass path: fully synchronous per-iteration MMA (matches
+                # v3's style exactly). The wait_group(1) lookahead pipelining
+                # below is a net win on larger/deeper-pipelined shapes, but
+                # profiling showed it adds a compiler-injected extra
+                # warpgroup.arrive/wait fence pair that costs a few percent
+                # on small, fast shapes -- exactly the shapes that pick
+                # swizzle_size=1 in the first place. So this path skips it.
+                for offset_k in self.range(0, k_size, block_k, unroll=num_stages):
+                    tma_pipe.consumer_acquire()
+                    self.wgmma.fence()
+                    self.wgmma.mma(
+                        sa[tma_pipe.consumer_stage],
+                        sb[tma_pipe.consumer_stage].transpose(),
+                        acc,
+                    )
+                    self.wgmma.commit_group()
+                    self.wgmma.wait_group(0)
+                    self.mbarrier.arrive(tma_pipe.consumer_barrier())
+                    tma_pipe.consumer_advance()
+            else:
+                # Prologue: issue first MMA; don't release stage 0 yet (it is
+                # still being read; we release it in the first main-loop
+                # iteration after wait_group(1) confirms the MMA is done).
                 tma_pipe.consumer_acquire()
                 self.wgmma.fence()
                 self.wgmma.mma(
-                    sa[tma_pipe.consumer_stage],
-                    sb[tma_pipe.consumer_stage].transpose(),
-                    acc,
+                    sa[tma_pipe.consumer_stage], sb[tma_pipe.consumer_stage].transpose(), acc
                 )
                 self.wgmma.commit_group()
-                self.wgmma.wait_group(1)
-                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
                 tma_pipe.consumer_advance()
 
-            # Epilogue: drain the last in-flight MMA group, then release its stage.
-            self.wgmma.wait_group(0)
-            self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+                # Main loop: issue MMA then call wait_group(1) *after* commit
+                # so the hardware can pipeline the current and previous
+                # groups while the TMA wait (consumer_acquire) was
+                # overlapping with the prior group. wait_group(1) stalls
+                # until the *previous* group (n-1) is done, then we safely
+                # release its stage before advancing.
+                for offset_k in self.range(block_k, k_size, block_k, unroll=num_stages):
+                    tma_pipe.consumer_acquire()
+                    self.wgmma.fence()
+                    self.wgmma.mma(
+                        sa[tma_pipe.consumer_stage],
+                        sb[tma_pipe.consumer_stage].transpose(),
+                        acc,
+                    )
+                    self.wgmma.commit_group()
+                    self.wgmma.wait_group(1)
+                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+                    tma_pipe.consumer_advance()
+
+                # Epilogue: drain the last in-flight MMA group, then release its stage.
+                self.wgmma.wait_group(0)
+                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
 
             self.sync()
             casted_acc = self.cast(acc, dtype=float16)
