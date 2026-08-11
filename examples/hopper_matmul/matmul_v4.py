@@ -68,13 +68,15 @@ class Pipeline(tilus.Class):
         self.consumer_phase = self.consumer_phase ^ (self.consumer_stage == 0)
 
 
-# A deliberately shallow synchronous pipeline makes v4 a clear intermediate
-# step between v3's single consumer WG and v5's deeper overlapped pipeline.
-# Keep the finalized search space to one deterministic H100 configuration.
-@tilus.autotune("num_stages", [2])
+# v4 stays synchronous (wait_group(0) after every commit) -- overlapping WGMMA
+# groups is v5's job. Three stages give the producer enough slack to stay ahead
+# of a consumer that drains its MMA every K-tile; two stages do not, and measure
+# no faster than v3. Keep the finalized search space to one deterministic H100
+# configuration.
+@tilus.autotune("num_stages", [3])
 @tilus.autotune("block_m, block_n", [[128, 256]])
 @tilus.autotune("block_k", [64])
-@tilus.autotune("swizzle_size", [1])
+@tilus.autotune("swizzle_size", [4])
 class MatmulWGMMAV4(tilus.Script):
     def __init__(self, num_stages, block_m, block_n, block_k, swizzle_size):
         super().__init__()
