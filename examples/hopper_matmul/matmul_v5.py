@@ -197,15 +197,13 @@ class MatmulWGMMAV5(tilus.Script):
                 )
                 self.wgmma.commit_group()
                 self.wgmma.wait_group(1)
-                with self.single_warp():
-                    with self.single_thread():
-                        self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+                with self.single_thread():
+                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
                 tma_pipe.consumer_advance()
 
             self.wgmma.wait_group(0)
-            with self.single_warp():
-                with self.single_thread():
-                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+            with self.single_thread():
+                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
 
             casted0 = self.cast(acc0, dtype=float16)
             self.store_global(gc, casted0, offsets=[offset_m, offset_n])
@@ -234,15 +232,13 @@ class MatmulWGMMAV5(tilus.Script):
                 )
                 self.wgmma.commit_group()
                 self.wgmma.wait_group(1)
-                with self.single_warp():
-                    with self.single_thread():
-                        self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+                with self.single_thread():
+                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
                 tma_pipe.consumer_advance()
 
             self.wgmma.wait_group(0)
-            with self.single_warp():
-                with self.single_thread():
-                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+            with self.single_thread():
+                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
 
             casted1 = self.cast(acc1, dtype=float16)
             self.store_global(gc, casted1, offsets=[offset_m + block_m_half, offset_n])

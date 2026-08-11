@@ -77,9 +77,12 @@ class MatmulTMA(tilus.Script):
             self.sync()
             phase ^= 1
 
-        self.free_shared(sa)
-        self.free_shared(sb)
-
+        # sa/sb are deliberately not freed. The epilogue allocates no shared
+        # memory, so freeing reclaims nothing -- but it would return those slots
+        # to the allocator's free list, and the mbarrier allocator (which runs
+        # after the whole function is emitted) would then be free to place the
+        # barriers inside a buffer the TMA engine writes throughout the loop
+        # above, silently corrupting the barrier state.
         casted_acc = self.cast(acc, dtype=float16)
         gc = self.global_view(c_ptr, dtype=float16, shape=[m_size, n_size])
         self.store_global(gc, casted_acc, offsets=[offset_m, offset_n])

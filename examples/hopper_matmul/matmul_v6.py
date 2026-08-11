@@ -140,15 +140,13 @@ class MatmulWGMMAV6(tilus.Script):
             )
             self.wgmma.commit_group()
             self.wgmma.wait_group(1)
-            with self.single_warp():
-                with self.single_thread():
-                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+            with self.single_thread():
+                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
             tma_pipe.consumer_advance()
 
         self.wgmma.wait_group(0)
-        with self.single_warp():
-            with self.single_thread():
-                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+        with self.single_thread():
+            self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
 
         if consumer_idx > 0:
             self.mbarrier.wait(epilogue_free[consumer_idx - 1], phase=0)
