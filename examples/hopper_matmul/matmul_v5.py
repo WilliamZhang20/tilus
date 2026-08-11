@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Optimizations from v4:
-# - Use mbarrier for synchronization between producer and consumer WGs, instead of using shared memory as flags.
-# - Use two consumer WGs to consume the produced tiles in parallel, and use WGMMA commit/wait group to synchronize between them, instead of using a single consumer WG to consume all tiles.
+# - Deepen the TMA pipeline from two stages to four.
+# - Keep two WGMMA groups in flight with commit/wait_group(1), overlapping
+#   tensor-core execution with the next stage's barrier and TMA work.
+# - Group the 1D tile raster for additional L2 reuse.
 
 import math
 
@@ -69,10 +71,11 @@ class Pipeline(tilus.Class):
 
 
 # block_m must be >= 128 so each WG's WGMMA M = block_m/2 >= 64.
-@tilus.autotune("num_stages", [3, 4, 5, 6])
-@tilus.autotune("block_m, block_n", [[128, 128], [128, 256], [256, 128], [256, 256]])
-@tilus.autotune("block_k", [16, 32, 64])
-@tilus.autotune("swizzle_size", [4, 8])
+# Best of the original 96-schedule search on H100.
+@tilus.autotune("num_stages", [4])
+@tilus.autotune("block_m, block_n", [[128, 256]])
+@tilus.autotune("block_k", [64])
+@tilus.autotune("swizzle_size", [4])
 class MatmulWGMMAV5(tilus.Script):
     def __init__(self, num_stages, block_m, block_n, block_k, swizzle_size):
         super().__init__()
@@ -134,9 +137,7 @@ class MatmulWGMMAV5(tilus.Script):
         )
         sb = self.shared_tensor(dtype=float16, shape=[num_stages, block_n, block_k])
 
-        tma_pipe = Pipeline(
-            num_stages, producer_arrive_count=1, consumer_arrive_count=256
-        )
+        tma_pipe = Pipeline(num_stages, producer_arrive_count=1, consumer_arrive_count=2)
 
         with self.thread_group(thread_begin=256, num_threads=32):  # TMA producer
             for offset_k in self.range(0, k_size, block_k, unroll=num_stages):
@@ -196,11 +197,15 @@ class MatmulWGMMAV5(tilus.Script):
                 )
                 self.wgmma.commit_group()
                 self.wgmma.wait_group(1)
-                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+                with self.single_warp():
+                    with self.single_thread():
+                        self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
                 tma_pipe.consumer_advance()
 
             self.wgmma.wait_group(0)
-            self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+            with self.single_warp():
+                with self.single_thread():
+                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
 
             casted0 = self.cast(acc0, dtype=float16)
             self.store_global(gc, casted0, offsets=[offset_m, offset_n])
@@ -229,11 +234,15 @@ class MatmulWGMMAV5(tilus.Script):
                 )
                 self.wgmma.commit_group()
                 self.wgmma.wait_group(1)
-                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+                with self.single_warp():
+                    with self.single_thread():
+                        self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
                 tma_pipe.consumer_advance()
 
             self.wgmma.wait_group(0)
-            self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+            with self.single_warp():
+                with self.single_thread():
+                    self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
 
             casted1 = self.cast(acc1, dtype=float16)
             self.store_global(gc, casted1, offsets=[offset_m + block_m_half, offset_n])
@@ -252,8 +261,8 @@ def main():
     for m, n, k in workloads:
         matmul = MatmulWGMMAV5()
 
-        a = (torch.rand(m, k, dtype=torch.float16).cuda() - 0.5) / math.sqrt(k)
-        b = (torch.rand(n, k, dtype=torch.float16).cuda() - 0.5) / math.sqrt(k)
+        a = torch.randn(m, k, dtype=torch.float16).cuda() / math.sqrt(k)
+        b = torch.randn(n, k, dtype=torch.float16).cuda()
         c_actual = torch.empty(m, n, dtype=torch.float16).cuda()
         c_expect = a @ b.T
         matmul(m, n, k, a, b, c_actual)

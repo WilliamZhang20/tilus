@@ -91,13 +91,7 @@ class WgmmaInstructionGroup(InstructionGroup):
         """
         self._builder.wgmma_wait_group(n)
 
-    def mma(
-        self,
-        a: SharedTensor | RegisterTensor,
-        b: SharedTensor,
-        d: RegisterTensor,
-        scale_d: int = 1,
-    ) -> None:
+    def mma(self, a: SharedTensor | RegisterTensor, b: SharedTensor, d: RegisterTensor) -> None:
         """Perform warp group matrix multiply-accumulate (MMA) operation.
 
         Computes ``d = a @ b + d`` where ``a`` is in shared or register memory, ``b`` is in
@@ -128,11 +122,9 @@ class WgmmaInstructionGroup(InstructionGroup):
             raise InstructionError(
                 "mma requires 2D tensors, got shapes {}".format([tensor.shape for tensor in (a, b, d)])
             )
-        if scale_d not in (0, 1):
-            raise InstructionError("scale_d must be 0 or 1, got {}".format(scale_d))
         if isinstance(a, SharedTensor):
-            self._builder.wgmma_mma_ss(a, b, d, scale_d=scale_d)
+            self._builder.wgmma_mma_ss(a, b, d)
         elif isinstance(a, RegisterTensor):
-            self._builder.wgmma_mma_rs(a, b, d, scale_d=scale_d)
+            self._builder.wgmma_mma_rs(a, b, d)
         else:
             raise InstructionError("Invalid type of a: {}, expected SharedTensor or RegisterTensor".format(type(a)))
