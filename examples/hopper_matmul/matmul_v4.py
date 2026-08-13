@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# v4: Pipeline class abstraction + tile rasterization for better L2 cache reuse.
+# v4: Pipeline abstraction + two WGMMA consumer warp groups.
 #
 # Changes from v3:
 #   - Pipeline class encapsulates barrier/phase/stage ring-buffer logic.
-#   - 1D grid launch with compute_block_coord() maps linear blockIdx to (m, n)
-#     using a swizzle group so adjacent tiles share B columns → L2 reuse.
+#   - Split each 128x256 output tile across two consumer warp groups so more
+#     independent WGMMA work can execute while the producer feeds the pipeline.
+#   - 1D tile rasterization supports grouped launch order for L2 reuse.
 
 import math
 
@@ -66,23 +67,16 @@ class Pipeline(tilus.Class):
         self.consumer_stage = (self.consumer_stage + 1) % self.num_stages
         self.consumer_phase = self.consumer_phase ^ (self.consumer_stage == 0)
 
-    def prev_consumer_barrier(self) -> RegisterTensor:
-        # Use (consumer_stage + num_stages - 1) so num_stages - 1 is evaluated as a
-        # Python int constant first, ensuring the inner expression is always non-negative
-        # and avoids C's negative-dividend truncated-modulo behaviour.
-        prev_stage = (self.consumer_stage + (self.num_stages - 1)) % self.num_stages
-        return self.empty_barriers[prev_stage]
 
-
-# Tightened autotune space: drop block_m=128/n=64 (skinny → poor wgmma fill),
-# drop block_m=256/n=128 (heavy register pressure), drop num_stages=2 (too
-# shallow to hide TMA), drop num_stages=7 (smem-thrashing on 256×256), drop
-# swizzle_size=1 (≡ default rasterization, no L2 win). The remaining 60 configs
-# are biased toward shapes cuBLAS uses for 8K² fp16 GEMMs.
-@tilus.autotune("num_stages", [3, 4, 5, 6])
-@tilus.autotune("block_m, block_n", [[128, 128], [128, 256], [256, 256]])
-@tilus.autotune("block_k", [16, 32, 64])
-@tilus.autotune("swizzle_size", [4, 8])
+# v4 stays synchronous (wait_group(0) after every commit) -- overlapping WGMMA
+# groups is v5's job. Three stages give the producer enough slack to stay ahead
+# of a consumer that drains its MMA every K-tile; two stages do not, and measure
+# no faster than v3. Keep the finalized search space to one deterministic H100
+# configuration.
+@tilus.autotune("num_stages", [3])
+@tilus.autotune("block_m, block_n", [[128, 256]])
+@tilus.autotune("block_k", [64])
+@tilus.autotune("swizzle_size", [4])
 class MatmulWGMMAV4(tilus.Script):
     def __init__(self, num_stages, block_m, block_n, block_k, swizzle_size):
         super().__init__()
@@ -126,31 +120,43 @@ class MatmulWGMMAV4(tilus.Script):
     ):
         num_stages = self.num_stages
         block_m, block_n, block_k = self.block_m, self.block_n, self.block_k
+        swizzle_size = self.swizzle_size
 
         num_m_blocks = cdiv(m_size, block_m)
         num_n_blocks = cdiv(n_size, block_n)
-        self.attrs.blocks = num_m_blocks * num_n_blocks
-        self.attrs.warps = 5
+        self.attrs.warps = 9  # 1 producer + 2 consumer warp groups
 
-        m_block, n_block = self.compute_block_coord(
-            self.blockIdx.x, num_m_blocks, num_n_blocks
-        )
-        offset_m: int32 = m_block * block_m
-        offset_n: int32 = n_block * block_n
+        offset_m: int32 = 0
+        offset_n: int32 = 0
+        if swizzle_size == 1:
+            # Bypass: plain 2D grid, identical rasterization to v3, with none
+            # of the swizzle-group address computation below. Resolved at
+            # trace time (swizzle_size is a compile-time autotune constant),
+            # so this branch costs nothing when swizzling is used instead.
+            self.attrs.blocks = [num_m_blocks, num_n_blocks]
+            offset_m = block_m * self.blockIdx.x
+            offset_n = block_n * self.blockIdx.y
+        else:
+            self.attrs.blocks = num_m_blocks * num_n_blocks
+            m_block, n_block = self.compute_block_coord(
+                self.blockIdx.x, num_m_blocks, num_n_blocks
+            )
+            offset_m = m_block * block_m
+            offset_n = n_block * block_n
 
         ga = self.global_view(a_ptr, dtype=float16, shape=[m_size, k_size])
         gb = self.global_view(b_ptr, dtype=float16, shape=[n_size, k_size])
-        sa = self.shared_tensor(dtype=float16, shape=[num_stages, block_m, block_k])
-        sb = self.shared_tensor(dtype=float16, shape=[num_stages, block_n, block_k])
-        acc = self.register_tensor(dtype=float32, shape=[block_m, block_n], init=0.0)
-
-        # producer_arrive_count=1: single thread does arrive_and_expect_tx
-        # consumer_arrive_count=128: all 128 consumer threads arrive when done
-        tma_pipe = Pipeline(
-            num_stages, producer_arrive_count=1, consumer_arrive_count=128
+        block_m_half = block_m // 2
+        sa = self.shared_tensor(
+            dtype=float16, shape=[num_stages, 2, block_m_half, block_k]
         )
+        sb = self.shared_tensor(dtype=float16, shape=[num_stages, block_n, block_k])
+        gc = self.global_view(c_ptr, dtype=float16, shape=[m_size, n_size])
 
-        with self.thread_group(thread_begin=128, num_threads=32):  # TMA producer warp
+        # Each consumer WG elects one thread to release a stage after wait_group(0).
+        tma_pipe = Pipeline(num_stages, producer_arrive_count=1, consumer_arrive_count=2)
+
+        with self.thread_group(thread_begin=256, num_threads=32):  # TMA producer warp
             for offset_k in self.range(0, k_size, block_k, unroll=num_stages):
                 tma_pipe.producer_acquire()
                 # Producer warp is already 32 threads — the granularity TMA
@@ -159,13 +165,20 @@ class MatmulWGMMAV4(tilus.Script):
                 with self.single_thread():
                     self.mbarrier.arrive_and_expect_tx(
                         tma_pipe.producer_barrier(),
-                        transaction_bytes=sa[tma_pipe.producer_stage].nbytes
+                        transaction_bytes=sa[tma_pipe.producer_stage, 0].nbytes
+                        + sa[tma_pipe.producer_stage, 1].nbytes
                         + sb[tma_pipe.producer_stage].nbytes,
                     )
                 self.tma.global_to_shared(
                     src=ga,
-                    dst=sa[tma_pipe.producer_stage],
+                    dst=sa[tma_pipe.producer_stage, 0],
                     offsets=[offset_m, offset_k],
+                    mbarrier=tma_pipe.producer_barrier(),
+                )
+                self.tma.global_to_shared(
+                    src=ga,
+                    dst=sa[tma_pipe.producer_stage, 1],
+                    offsets=[offset_m + block_m_half, offset_k],
                     mbarrier=tma_pipe.producer_barrier(),
                 )
                 self.tma.global_to_shared(
@@ -181,44 +194,49 @@ class MatmulWGMMAV4(tilus.Script):
                 tma_pipe.producer_acquire()
                 tma_pipe.producer_advance()
 
-        with self.thread_group(thread_begin=0, num_threads=128):  # WGMMA consumer
-            # Prologue: issue first MMA; don't release stage 0 yet (it is
-            # still being read; we release it in the first main-loop iteration
-            # after wait_group(1) confirms the MMA is done).
-            tma_pipe.consumer_acquire()
-            self.wgmma.fence()
-            self.wgmma.mma(
-                sa[tma_pipe.consumer_stage], sb[tma_pipe.consumer_stage].transpose(), acc
+        with self.thread_group(thread_begin=0, num_threads=128):  # consumer WG0
+            acc0 = self.register_tensor(
+                dtype=float32, shape=[block_m_half, block_n], init=0.0
             )
-            self.wgmma.commit_group()
-            tma_pipe.consumer_advance()
-
-            # Main loop: issue MMA then call wait_group(1) *after* commit so
-            # the hardware can pipeline the current and previous groups while
-            # the TMA wait (consumer_acquire) was overlapping with the prior
-            # group. wait_group(1) stalls until the *previous* group (n-1) is
-            # done, then we safely release its stage before advancing.
-            for offset_k in self.range(block_k, k_size, block_k, unroll=num_stages):
+            for offset_k in self.range(0, k_size, block_k, unroll=num_stages):
                 tma_pipe.consumer_acquire()
                 self.wgmma.fence()
                 self.wgmma.mma(
-                    sa[tma_pipe.consumer_stage],
+                    sa[tma_pipe.consumer_stage, 0],
                     sb[tma_pipe.consumer_stage].transpose(),
-                    acc,
+                    acc0,
                 )
                 self.wgmma.commit_group()
-                self.wgmma.wait_group(1)
-                self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
+                self.wgmma.wait_group(0)
+                with self.single_thread():
+                    self.mbarrier.arrive(tma_pipe.consumer_barrier())
                 tma_pipe.consumer_advance()
+            self.store_global(
+                gc, self.cast(acc0, dtype=float16), offsets=[offset_m, offset_n]
+            )
 
-            # Epilogue: drain the last in-flight MMA group, then release its stage.
-            self.wgmma.wait_group(0)
-            self.mbarrier.arrive(tma_pipe.prev_consumer_barrier())
-
-            self.sync()
-            casted_acc = self.cast(acc, dtype=float16)
-            gc = self.global_view(c_ptr, dtype=float16, shape=[m_size, n_size])
-            self.store_global(gc, casted_acc, offsets=[offset_m, offset_n])
+        with self.thread_group(thread_begin=128, num_threads=128):  # consumer WG1
+            acc1 = self.register_tensor(
+                dtype=float32, shape=[block_m_half, block_n], init=0.0
+            )
+            for offset_k in self.range(0, k_size, block_k, unroll=num_stages):
+                tma_pipe.consumer_acquire()
+                self.wgmma.fence()
+                self.wgmma.mma(
+                    sa[tma_pipe.consumer_stage, 1],
+                    sb[tma_pipe.consumer_stage].transpose(),
+                    acc1,
+                )
+                self.wgmma.commit_group()
+                self.wgmma.wait_group(0)
+                with self.single_thread():
+                    self.mbarrier.arrive(tma_pipe.consumer_barrier())
+                tma_pipe.consumer_advance()
+            self.store_global(
+                gc,
+                self.cast(acc1, dtype=float16),
+                offsets=[offset_m + block_m_half, offset_n],
+            )
 
 
 def main():
@@ -234,8 +252,8 @@ def main():
     for m, n, k in workloads:
         matmul = MatmulWGMMAV4()
 
-        a = (torch.rand(m, k, dtype=torch.float16).cuda() - 0.5) / math.sqrt(k)
-        b = (torch.rand(n, k, dtype=torch.float16).cuda() - 0.5) / math.sqrt(k)
+        a = torch.randn(m, k, dtype=torch.float16).cuda() / math.sqrt(k)
+        b = torch.randn(n, k, dtype=torch.float16).cuda()
         c_actual = torch.empty(m, n, dtype=torch.float16).cuda()
         c_expect = a @ b.T
         matmul(m, n, k, a, b, c_actual)
